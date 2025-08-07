@@ -17,6 +17,7 @@ newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
 NEWSAPI_AI_KEY = st.secrets.get("NEWSAPI_AI_KEY")
 if not NEWSAPI_AI_KEY:
     st.warning("⚠️ No NEWSAPI_AI_KEY (newsapi.ai) found in secrets. Skipping Event Registry fetch.")
+    er_client = None
 else:
     er_client = EventRegistry(apiKey=NEWSAPI_AI_KEY)
 
@@ -33,9 +34,8 @@ with col1:
 with col2:
     end_date = st.date_input("End Date")
 
-# ——— Fetchers ———
+# ——— Fetch from NewsAPI.org ———
 def fetch_newsapi(query, start, end):
-    """Fetch from NewsAPI.org"""
     try:
         resp = newsapi.get_everything(
             q=query,
@@ -51,36 +51,40 @@ def fetch_newsapi(query, start, end):
         return []
     rows = []
     for art in resp.get("articles", []):
-        pub   = art.get("source", {}).get("name", "")
+        pub = art.get("source", {}).get("name", "")
         try:
             dated = parser.parse(art.get("publishedAt")).strftime("%B %-d, %Y")
         except:
             dated = art.get("publishedAt", "")
         title = art.get("title", "")
-        url   = art.get("url", "")
+        url = art.get("url", "")
         rows.append((pub, dated, title, url))
     return rows
 
+# ——— Fetch from newsapi.ai (Event Registry) ———
 def fetch_eventregistry(query, start, end):
-    """Fetch from newsapi.ai (Event Registry)"""
-    if not NEWSAPI_AI_KEY:
+    if not er_client:
         return []
-    q = QueryArticlesIter(
-        keywords = query,
-        dateStart = start.isoformat(),
-        dateEnd   = end.isoformat()
-    )
-    arts = q.execQuery(er_client, maxItems=100)
+    try:
+        q = QueryArticlesIter(
+            keywords=query,
+            dateStart=start.isoformat(),
+            dateEnd=end.isoformat()
+        )
+        arts = q.execQuery(er_client, maxItems=100)
+    except Exception as e:
+        st.warning(f"⚠️ EventRegistry fetch failed: {e}")
+        return []
     rows = []
     for art in arts:
-        pub   = art.get("source", {}).get("uri", "")
-        date  = art.get("date", "")  # YYYY-MM-DD
+        pub = art.get("source", {}).get("uri", "")
+        date = art.get("date", "")
         try:
             dated = parser.parse(date).strftime("%B %-d, %Y")
         except:
             dated = date
         title = art.get("title", "")
-        url   = art.get("url", "")
+        url = art.get("url", "")
         rows.append((pub, dated, title, url))
     return rows
 
@@ -89,40 +93,29 @@ if st.button("Fetch Press Pickup"):
     if not client or not project:
         st.error("⚠️ Please enter both a client name and a project/film name.")
     else:
-        q = f"{client} {project}"
-        # 1) NewsAPI.org
-        rows = fetch_newsapi(q, start_date, end_date)
-        # 2) newsapi.ai / Event Registry
-        rows += fetch_eventregistry(q, start_date, end_date)
-        # 3) TODO: Combine in Google Custom Search or RSS later
+        query = f"{client} {project}"
+        rows = fetch_newsapi(query, start_date, end_date) + fetch_eventregistry(query, start_date, end_date)
 
-        # — Dedupe & sort —
-        seen, unique = set(), []
+        # — Deduplicate & sort —
+        seen = set()
+        unique = []
         for pub, dt, title, url in rows:
             if url and url not in seen:
                 seen.add(url)
                 unique.append((pub, dt, title, url))
-        def sort_key(x):
-            try: return parser.parse(x[1])
-            except: return x[1]
-        unique.sort(key=sort_key, reverse=True)
+        try:
+            unique.sort(key=lambda x: parser.parse(x[1]), reverse=True)
+        except:
+            unique.sort(key=lambda x: x[1], reverse=True)
 
         if not unique:
             st.info("ℹ️ No press pickups found for that query and date range.")
         else:
             df = pd.DataFrame(unique, columns=["Publisher", "Date", "Headline", "URL"])
 
-            # — HTML table (copy→Gmail) —
-            st.markdown("### Results (Table)")
-            st.table(df)
-
-            # — Markdown table —
-            md = "| Publisher | Date | Headline | URL |\n|---|---|---|---|"
-            for pub, dt, title, url in unique:
-                safe = title.replace("|", "\\|")
-                md += f"\n| {pub} | {dt} | {safe} | {url} |"
-            st.markdown("### Results (Markdown Table)")
-            st.code(md, language="markdown")
+            # — Interactive table (sortable/filterable) —
+            st.markdown("### Results (Interactive Table)")
+            st.dataframe(df)
 
             # — CSV download —
             st.download_button(
@@ -134,7 +127,8 @@ if st.button("Fetch Press Pickup"):
 
             # — Email template —
             st.markdown("### 📋 Email Template")
-            template = []
-            for pub, dt, title, url in unique:
-                template.append(f"**{pub}**  |  {dt}  |  {title}\n\nLink: {url}\n\n---")
-            st.code("\n".join(template), language="markdown")
+            template_lines = [
+                f"**{pub}**  |  {dt}  |  {title}\n\nLink: {url}\n\n---"
+                for pub, dt, title, url in unique
+            ]
+            st.code("\n".join(template_lines), language="markdown")
