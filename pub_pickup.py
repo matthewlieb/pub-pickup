@@ -1,20 +1,30 @@
+# pub_pickup.py
+
 import streamlit as st
 from newsapi.newsapi_client import NewsApiClient
 from newsapi.newsapi_exception import NewsAPIException
+from eventregistry import EventRegistry, QueryArticlesIter
 from dateutil import parser
+import pandas as pd
 
-# Initialize NewsAPI client (set your key in ~/.streamlit/secrets.toml)
-API_KEY = st.secrets.get("NEWSAPI_KEY")
-if not API_KEY:
+# ——— Initialize API clients ———
+NEWSAPI_KEY = st.secrets.get("NEWSAPI_KEY")
+if not NEWSAPI_KEY:
     st.error("🛑 No NEWSAPI_KEY found. Please configure it in your Streamlit secrets.")
     st.stop()
+newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
 
-newsapi = NewsApiClient(api_key=API_KEY)
+NEWSAPI_AI_KEY = st.secrets.get("NEWSAPI_AI_KEY")
+if not NEWSAPI_AI_KEY:
+    st.warning("⚠️ No NEWSAPI_AI_KEY (newsapi.ai) found in secrets. Skipping Event Registry fetch.")
+else:
+    er_client = EventRegistry(apiKey=NEWSAPI_AI_KEY)
 
+# ——— Page config & title ———
 st.set_page_config(page_title="Press Pickup Automator", layout="wide")
 st.title("📰 Press Pickup Automator")
 
-# ——— Input form ———
+# ——— Inputs ———
 client = st.text_input("Client / Talent Name", help="e.g. John Krasinski")
 project = st.text_input("Project / Film Name", help="e.g. Quiet Place 3")
 col1, col2 = st.columns(2)
@@ -23,14 +33,11 @@ with col1:
 with col2:
     end_date = st.date_input("End Date")
 
-# ——— NewsAPI Fetcher with error handling ———
+# ——— Fetchers ———
 def fetch_newsapi(query, start, end):
-    """
-    Returns a list of tuples: (publisher, date_str, headline, url)
-    If NewsAPI errors (e.g. invalid key or date), shows an error and returns an empty list.
-    """
+    """Fetch from NewsAPI.org"""
     try:
-        response = newsapi.get_everything(
+        resp = newsapi.get_everything(
             q=query,
             from_param=start.isoformat(),
             to=end.isoformat(),
@@ -39,76 +46,95 @@ def fetch_newsapi(query, start, end):
             page_size=100,
         )
     except NewsAPIException as e:
-        # e.args[0] is a dict containing 'code' and 'message'
         err = e.args[0] if e.args and isinstance(e.args[0], dict) else {"message": str(e)}
-        st.error(f"⚠️ NewsAPI error: {err.get('message', str(e))}")
+        st.error(f"⚠️ NewsAPI.org error: {err.get('message')}")
         return []
-
-    articles = response.get("articles", [])
     rows = []
-    for art in articles:
-        pub       = art.get("source", {}).get("name", "")
+    for art in resp.get("articles", []):
+        pub   = art.get("source", {}).get("name", "")
         try:
             dated = parser.parse(art.get("publishedAt")).strftime("%B %-d, %Y")
-        except Exception:
+        except:
             dated = art.get("publishedAt", "")
-        headline  = art.get("title", "")
-        url       = art.get("url", "")
-        rows.append((pub, dated, headline, url))
+        title = art.get("title", "")
+        url   = art.get("url", "")
+        rows.append((pub, dated, title, url))
     return rows
 
-# ——— Placeholders for future sources ———
-# def fetch_google(query, start, end):
-#     return []
+def fetch_eventregistry(query, start, end):
+    """Fetch from newsapi.ai (Event Registry)"""
+    if not NEWSAPI_AI_KEY:
+        return []
+    q = QueryArticlesIter(
+        keywords = query,
+        dateStart = start.isoformat(),
+        dateEnd   = end.isoformat()
+    )
+    arts = q.execQuery(er_client, maxItems=100)
+    rows = []
+    for art in arts:
+        pub   = art.get("source", {}).get("uri", "")
+        date  = art.get("date", "")  # YYYY-MM-DD
+        try:
+            dated = parser.parse(date).strftime("%B %-d, %Y")
+        except:
+            dated = date
+        title = art.get("title", "")
+        url   = art.get("url", "")
+        rows.append((pub, dated, title, url))
+    return rows
 
-# def fetch_rss(query, start, end):
-#     return []
-
-# ——— Fetch button ———
+# ——— Button handler ———
 if st.button("Fetch Press Pickup"):
     if not client or not project:
         st.error("⚠️ Please enter both a client name and a project/film name.")
     else:
-        query = f"{client} {project}"
-        rows = fetch_newsapi(query, start_date, end_date)
-        # rows += fetch_google(query, start_date, end_date)
-        # rows += fetch_rss(query, start_date, end_date)
+        q = f"{client} {project}"
+        # 1) NewsAPI.org
+        rows = fetch_newsapi(q, start_date, end_date)
+        # 2) newsapi.ai / Event Registry
+        rows += fetch_eventregistry(q, start_date, end_date)
+        # 3) TODO: Combine in Google Custom Search or RSS later
 
-        # ——— Deduplicate & sort ———
-        seen = set()
-        uniq = []
-        for pub, dt, headline, url in rows:
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            uniq.append((pub, dt, headline, url))
+        # — Dedupe & sort —
+        seen, unique = set(), []
+        for pub, dt, title, url in rows:
+            if url and url not in seen:
+                seen.add(url)
+                unique.append((pub, dt, title, url))
+        def sort_key(x):
+            try: return parser.parse(x[1])
+            except: return x[1]
+        unique.sort(key=sort_key, reverse=True)
 
-        def sort_key(item):
-            try:
-                return parser.parse(item[1])
-            except:
-                return item[1]
-        uniq.sort(key=sort_key, reverse=True)
-
-        # ——— Display results ———
-        if uniq:
-            st.markdown("### Results")
-            st.table(uniq)
-
-            # ——— Render email template ———
-            st.markdown("### 📋 Email Template (Markdown)")
-            md_lines = []
-            for pub, dt, headline, url in uniq:
-                md_lines.append(f"**{pub}**  |  {dt}  |  {headline}\n\nLink: {url}\n\n---")
-            body = "\n".join(md_lines)
-            st.code(body, language="markdown")
-
-            # ——— Download button ———
-            st.download_button(
-                label="Download as Markdown",
-                data=body,
-                file_name=f"{client.replace(' ', '_')}_{project.replace(' ', '_')}_pickup.md",
-                mime="text/markdown"
-            )
-        else:
+        if not unique:
             st.info("ℹ️ No press pickups found for that query and date range.")
+        else:
+            df = pd.DataFrame(unique, columns=["Publisher", "Date", "Headline", "URL"])
+
+            # — HTML table (copy→Gmail) —
+            st.markdown("### Results (Table)")
+            st.table(df)
+
+            # — Markdown table —
+            md = "| Publisher | Date | Headline | URL |\n|---|---|---|---|"
+            for pub, dt, title, url in unique:
+                safe = title.replace("|", "\\|")
+                md += f"\n| {pub} | {dt} | {safe} | {url} |"
+            st.markdown("### Results (Markdown Table)")
+            st.code(md, language="markdown")
+
+            # — CSV download —
+            st.download_button(
+                "Download CSV",
+                data=df.to_csv(index=False),
+                file_name=f"{client.replace(' ','_')}_{project.replace(' ','_')}_pickup.csv",
+                mime="text/csv"
+            )
+
+            # — Email template —
+            st.markdown("### 📋 Email Template")
+            template = []
+            for pub, dt, title, url in unique:
+                template.append(f"**{pub}**  |  {dt}  |  {title}\n\nLink: {url}\n\n---")
+            st.code("\n".join(template), language="markdown")
