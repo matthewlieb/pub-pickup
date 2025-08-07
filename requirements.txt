@@ -3,3 +3,4 @@ newsapi-python
 python-dateutil
 feedparser
 google-api-python-client
+eventregistry
